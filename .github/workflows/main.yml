@@ -1,0 +1,127 @@
+name: Panel Auto Backup
+
+on:
+  schedule:
+    # ví dụ: chạy lúc 03:00 UTC mỗi ngày (GMT+7 là 10:00)
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}  # cho phép bấm chạy tay trong tab Actions
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    env:
+      PANEL_URL: ${{ secrets.PANEL_URL }}
+      API_KEY: ${{ secrets.PANEL_API_KEY }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      MAX_BACKUPS: ${{ secrets.MAX_BACKUPS }} # có thể không tạo, default = 10
+
+    steps:
+      - name: Run backup via curl
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PANEL_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "❌ Thiếu env: PANEL_URL / API_KEY / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID"
+            exit 1
+          fi
+
+          if [ -z "${MAX_BACKUPS:-}" ]; then
+            MAX_BACKUPS=10
+          fi
+
+          echo "Using MAX_BACKUPS=${MAX_BACKUPS}"
+
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+
+          send_telegram() {
+            local text="$1"
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${text}" \
+              -d "parse_mode=Markdown" >/dev/null || true
+          }
+
+          api_request() {
+            local method="$1"
+            local url="$2"
+            shift 2 || true
+            curl -sS -X "$method" "$url" \
+              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "User-Agent: DBH" \
+              -H "X-Requested-With: XMLHttpRequest" \
+              -H "Cache-Control: no-cache" \
+              -H "Pragma: no-cache" \
+              "$@"
+          }
+
+          PANEL_URL="${PANEL_URL%/}"
+
+          echo "🔍 Lấy danh sách server..."
+          servers_json=$(api_request GET "${PANEL_URL}/api/client") || {
+            msg="❌ Lỗi nghiêm trọng: Không thể lấy danh sách server."
+            echo "$msg"
+            send_telegram "$msg"
+            exit 1
+          }
+
+          server_count=$(echo "$servers_json" | jq '.data | length')
+          echo "Tìm thấy ${server_count} server."
+
+          if [ "$server_count" -eq 0 ]; then
+            echo "Không có server nào, thoát."
+            exit 0
+          fi
+
+          for row in $(echo "$servers_json" | jq -r '.data[] | @base64'); do
+            _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
+
+            server_id=$(_jq '.attributes.identifier')
+            server_name=$(_jq '.attributes.name')
+
+            echo "==============================="
+            echo "▶ Xử lý server: ${server_name} (${server_id})"
+
+            backups_json=$(api_request GET "${PANEL_URL}/api/client/servers/${server_id}/backups") || {
+              msg="❌ Không thể lấy danh sách backup cho server *${server_name}*."
+              echo "$msg"
+              send_telegram "$msg"
+              continue
+            }
+
+            backup_count=$(echo "$backups_json" | jq '.data | length')
+            echo "Hiện có ${backup_count} backup."
+
+            if [ "$backup_count" -ge "$MAX_BACKUPS" ]; then
+              echo "Đang xóa backup cũ nhất..."
+              oldest=$(echo "$backups_json" | jq -r '.data | sort_by(.attributes.created_at) | .[0]')
+              oldest_name=$(echo "$oldest" | jq -r '.attributes.name')
+              oldest_uuid=$(echo "$oldest" | jq -r '.attributes.uuid')
+
+              api_request DELETE "${PANEL_URL}/api/client/servers/${server_id}/backups/${oldest_uuid}" >/dev/null || {
+                msg="❌ Không thể xóa backup cũ cho server *${server_name}*."
+                echo "$msg"
+                send_telegram "$msg"
+              }
+
+              send_telegram "🗑️ Đã xóa backup cũ nhất của server *${server_name}*.\n\`${oldest_name}\`"
+            fi
+
+            backup_name="Auto Backup $(date '+%H-%M_%d-%m-%Y')"
+            echo "Tạo backup mới: ${backup_name}"
+            body=$(jq -n --arg name "$backup_name" '{name: $name}')
+
+            new_backup=$(api_request POST "${PANEL_URL}/api/client/servers/${server_id}/backups" \
+              --data "$body") || {
+                msg="❌ Backup thất bại cho server *${server_name}*."
+                echo "$msg"
+                send_telegram "$msg"
+                continue
+              }
+
+            created_name=$(echo "$new_backup" | jq -r '.attributes.name')
+            send_telegram "✅ Backup thành công server *${server_name}*.\n\n📦 *Tên*: \`${created_name}\`"
+          done
