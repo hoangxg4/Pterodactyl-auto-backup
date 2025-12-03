@@ -2,8 +2,7 @@ name: Panel Auto Backup
 
 on:
   schedule:
-    # chạy mỗi 12 tiếng
-    - cron: "0 */12 * * *"
+    - cron: "0 */12 * * *"   # chạy mỗi 12 giờ
   workflow_dispatch: {}
 
 jobs:
@@ -11,13 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PANEL_URL: ${{ secrets.PANEL_URL }}
-      API_KEY: ${{ secrets.PANEL_API_KEY }}
+      PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       MAX_BACKUPS: ${{ secrets.MAX_BACKUPS }}
 
     steps:
-      - name: Run backup via curl
+      - name: Run backup
         run: |
           set -euo pipefail
 
@@ -29,9 +28,9 @@ jobs:
           send_telegram() {
             local msg="$1"
             curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-              -d "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${msg}" \
-              -d "parse_mode=Markdown" >/dev/null || true
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="${msg}" \
+              -d parse_mode=Markdown >/dev/null || true
           }
 
           api_request() {
@@ -39,7 +38,7 @@ jobs:
             local url="$2"
             shift 2 || true
             curl -sS -X "$method" "$url" \
-              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Authorization: Bearer ${PANEL_API_KEY}" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               -H "User-Agent: DBH" \
@@ -51,7 +50,7 @@ jobs:
 
           PANEL_URL="${PANEL_URL%/}"
 
-          echo "Lấy danh sách server..."
+          echo "Fetching servers..."
           servers_json=$(api_request GET "${PANEL_URL}/api/client")
 
           for row in $(echo "$servers_json" | jq -r '.data[] | @base64'); do
@@ -63,7 +62,7 @@ jobs:
             backups_json=$(api_request GET "${PANEL_URL}/api/client/servers/${server_id}/backups")
             backup_count=$(echo "$backups_json" | jq '.data | length')
 
-            # XÓA BACKUP CŨ
+            # Delete old backup
             if [ "$backup_count" -ge "$MAX_BACKUPS" ]; then
               oldest=$(echo "$backups_json" | jq -r '.data | sort_by(.attributes.created_at) | .[0]')
               oldest_name=$(echo "$oldest" | jq -r '.attributes.name')
@@ -71,19 +70,17 @@ jobs:
 
               api_request DELETE "${PANEL_URL}/api/client/servers/${server_id}/backups/${oldest_uuid}" >/dev/null
 
-              send_telegram \
-"🗑️ Đã xóa backup cũ nhất của server *${server_name}*
+              send_telegram "🗑️ Đã xóa backup cũ nhất của server *${server_name}*
 📦 Tên: ${oldest_name}"
             fi
 
-            # TẠO BACKUP MỚI
+            # Create new backup
             backup_name="Auto Backup $(date '+%H-%M_%d-%m-%Y')"
             body=$(jq -n --arg name "$backup_name" '{name: $name}')
 
             new_backup=$(api_request POST "${PANEL_URL}/api/client/servers/${server_id}/backups" --data "$body")
             created_name=$(echo "$new_backup" | jq -r '.attributes.name')
 
-            send_telegram \
-"✅ Backup thành công server *${server_name}*
+            send_telegram "✅ Backup thành công server *${server_name}*
 📦 Tên: ${created_name}"
           done
