@@ -5,6 +5,10 @@ on:
     - cron: "0 */12 * * *"
   workflow_dispatch: {}
 
+# ⚠️ QUAN TRỌNG: Cấp quyền ghi để Action có thể push file vào repo
+permissions:
+  contents: write
+
 jobs:
   backup:
     runs-on: ubuntu-latest
@@ -16,7 +20,11 @@ jobs:
       MAX_BACKUPS: ${{ secrets.MAX_BACKUPS }}
 
     steps:
-      - name: Run backup via curl
+      # 1. Phải có bước này để tải code về thì mới sửa file và push lại được
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run backup & Update Status
         run: |
           set -euo pipefail
 
@@ -58,18 +66,18 @@ jobs:
           echo "🔍 Lấy danh sách server..."
           servers_json=$(api_request GET "${PANEL_URL}/api/client") || exit 1
 
-          # KHỞI TẠO BIẾN TỔNG HỢP
           SUCCESS_COUNT=0
           FAIL_COUNT=0
           MESSAGE_DETAILS=""
+          
+          # Biến lưu nội dung cho file log
+          FILE_CONTENT="Last Update: $(date '+%H:%M %d/%m/%Y') (UTC)\n\n"
 
           for row in $(echo "$servers_json" | jq -r '.data[] | @base64'); do
             _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
             server_id=$(_jq '.attributes.identifier')
             server_name=$(_jq '.attributes.name')
-            
-            # Biến tạm để lưu thông tin của riêng server này
             server_log=""
 
             echo "▶ Xử lý server: ${server_name}"
@@ -77,11 +85,12 @@ jobs:
             # 1. Lấy danh sách backup
             backups_json=$(api_request GET "${PANEL_URL}/api/client/servers/${server_id}/backups") || {
               FAIL_COUNT=$((FAIL_COUNT+1))
-              MESSAGE_DETAILS="${MESSAGE_DETAILS}❌ <b>${server_name}</b>: Lỗi lấy danh sách backup"$'\n'
+              MESSAGE_DETAILS="${MESSAGE_DETAILS}❌ <b>${server_name}</b>: Lỗi lấy danh sách"$'\n'
+              FILE_CONTENT="${FILE_CONTENT}[FAIL] ${server_name}: Lỗi API\n"
               continue
             }
 
-            # 2. Xóa backup cũ nếu đầy
+            # 2. Xóa backup cũ
             backup_count=$(echo "$backups_json" | jq '.data | length')
             if [ "$backup_count" -ge "$MAX_BACKUPS" ]; then
               oldest=$(echo "$backups_json" | jq -r '.data | sort_by(.attributes.created_at) | .[0]')
@@ -101,24 +110,46 @@ jobs:
             if [ $? -eq 0 ]; then
               created_name=$(echo "$new_backup" | jq -r '.attributes.name')
               SUCCESS_COUNT=$((SUCCESS_COUNT+1))
-              # Gộp log xóa (nếu có) và log tạo thành công
               MESSAGE_DETAILS="${MESSAGE_DETAILS}✅ <b>${server_name}</b>"$'\n'"${server_log}📦 Tên: ${created_name}"$'\n\n'
+              FILE_CONTENT="${FILE_CONTENT}[OK] ${server_name} -> ${created_name}\n"
             else
               FAIL_COUNT=$((FAIL_COUNT+1))
               MESSAGE_DETAILS="${MESSAGE_DETAILS}❌ <b>${server_name}</b>: Backup thất bại"$'\n\n'
+              FILE_CONTENT="${FILE_CONTENT}[FAIL] ${server_name}: Tạo backup thất bại\n"
             fi
           done
 
-          # --- GỬI TIN NHẮN TỔNG HỢP ---
-          # Tạo header thống kê
+          # --- GỬI TELEGRAM ---
           TOTAL_MSG="📊 <b>BÁO CÁO AUTO BACKUP</b>"$'\n'
           TOTAL_MSG="${TOTAL_MSG}──────────────────"$'\n'
           TOTAL_MSG="${TOTAL_MSG}✅ Thành công: <b>${SUCCESS_COUNT}</b>"$'\n'
           TOTAL_MSG="${TOTAL_MSG}❌ Thất bại: <b>${FAIL_COUNT}</b>"$'\n'
           TOTAL_MSG="${TOTAL_MSG}──────────────────"$'\n\n'
           
-          # Ghép với nội dung chi tiết
           FINAL_MSG="${TOTAL_MSG}${MESSAGE_DETAILS}"
-
-          echo "Gửi báo cáo về Telegram..."
           send_telegram "$FINAL_MSG"
+
+          # --- TẠO FILE VÀ PUSH GIT ---
+          echo "📝 Đang cập nhật trạng thái vào repo..."
+          
+          # Ghi nội dung vào file status.txt
+          echo -e "${FILE_CONTENT}" > status.txt
+          echo "-----------------------------------" >> status.txt
+          echo "Total Success: ${SUCCESS_COUNT}" >> status.txt
+          echo "Total Fail: ${FAIL_COUNT}" >> status.txt
+
+          # Cấu hình Git (Bot Identity)
+          git config --global user.name "Auto Backup Bot"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add, Commit và Push
+          git add status.txt
+          
+          # Chỉ commit nếu có thay đổi (tránh lỗi nếu file y hệt cũ - dù có timestamp thì hiếm khi trùng)
+          if git diff --staged --quiet; then
+            echo "Không có thay đổi để commit."
+          else
+            git commit -m "Update backup status: $(date '+%d/%m/%Y')"
+            git push
+            echo "✅ Đã push file status.txt thành công!"
+          fi
