@@ -2,7 +2,7 @@ name: Panel Auto Backup
 
 on:
   schedule:
-    - cron: "0 */12 * * *"   # chạy mỗi 12 giờ
+    - cron: "0 */12 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -10,27 +10,34 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PANEL_URL: ${{ secrets.PANEL_URL }}
-      PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
+      API_KEY: ${{ secrets.PANEL_API_KEY }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       MAX_BACKUPS: ${{ secrets.MAX_BACKUPS }}
 
     steps:
-      - name: Run backup
+      - name: Run backup via curl
         run: |
           set -euo pipefail
+
+          # --- KIỂM TRA MÔI TRƯỜNG ---
+          if [ -z "${PANEL_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "❌ Thiếu env: PANEL_URL / API_KEY / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID"
+            exit 1
+          fi
 
           if [ -z "${MAX_BACKUPS:-}" ]; then MAX_BACKUPS=10; fi
 
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y jq >/dev/null
 
+          # --- HÀM GỬI TELEGRAM ---
           send_telegram() {
-            local msg="$1"
+            local text="$1"
             curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode text="${msg}" \
-              -d parse_mode=Markdown >/dev/null || true
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${text}" \
+              -d "parse_mode=HTML" >/dev/null || true
           }
 
           api_request() {
@@ -38,49 +45,80 @@ jobs:
             local url="$2"
             shift 2 || true
             curl -sS -X "$method" "$url" \
-              -H "Authorization: Bearer ${PANEL_API_KEY}" \
+              -H "Authorization: Bearer ${API_KEY}" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               -H "User-Agent: DBH" \
-              -H "X-Requested-With: XMLHttpRequest" \
-              -H "Cache-Control: no-cache" \
-              -H "Pragma: no-cache" \
               "$@"
           }
 
           PANEL_URL="${PANEL_URL%/}"
 
-          echo "Fetching servers..."
-          servers_json=$(api_request GET "${PANEL_URL}/api/client")
+          # --- BẮT ĐẦU XỬ LÝ ---
+          echo "🔍 Lấy danh sách server..."
+          servers_json=$(api_request GET "${PANEL_URL}/api/client") || exit 1
+
+          # KHỞI TẠO BIẾN TỔNG HỢP
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+          MESSAGE_DETAILS=""
 
           for row in $(echo "$servers_json" | jq -r '.data[] | @base64'); do
             _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
             server_id=$(_jq '.attributes.identifier')
             server_name=$(_jq '.attributes.name')
+            
+            # Biến tạm để lưu thông tin của riêng server này
+            server_log=""
 
-            backups_json=$(api_request GET "${PANEL_URL}/api/client/servers/${server_id}/backups")
+            echo "▶ Xử lý server: ${server_name}"
+
+            # 1. Lấy danh sách backup
+            backups_json=$(api_request GET "${PANEL_URL}/api/client/servers/${server_id}/backups") || {
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              MESSAGE_DETAILS="${MESSAGE_DETAILS}❌ <b>${server_name}</b>: Lỗi lấy danh sách backup"$'\n'
+              continue
+            }
+
+            # 2. Xóa backup cũ nếu đầy
             backup_count=$(echo "$backups_json" | jq '.data | length')
-
-            # Delete old backup
             if [ "$backup_count" -ge "$MAX_BACKUPS" ]; then
               oldest=$(echo "$backups_json" | jq -r '.data | sort_by(.attributes.created_at) | .[0]')
-              oldest_name=$(echo "$oldest" | jq -r '.attributes.name')
               oldest_uuid=$(echo "$oldest" | jq -r '.attributes.uuid')
+              oldest_name=$(echo "$oldest" | jq -r '.attributes.name')
 
-              api_request DELETE "${PANEL_URL}/api/client/servers/${server_id}/backups/${oldest_uuid}" >/dev/null
-
-              send_telegram "🗑️ Đã xóa backup cũ nhất của server *${server_name}*
-📦 Tên: ${oldest_name}"
+              api_request DELETE "${PANEL_URL}/api/client/servers/${server_id}/backups/${oldest_uuid}" >/dev/null && \
+              server_log="${server_log}🗑️ Đã xóa: ${oldest_name}"$'\n'
             fi
 
-            # Create new backup
+            # 3. Tạo backup mới
             backup_name="Auto Backup $(date '+%H-%M_%d-%m-%Y')"
             body=$(jq -n --arg name "$backup_name" '{name: $name}')
 
-            new_backup=$(api_request POST "${PANEL_URL}/api/client/servers/${server_id}/backups" --data "$body")
-            created_name=$(echo "$new_backup" | jq -r '.attributes.name')
-
-            send_telegram "✅ Backup thành công server *${server_name}*
-📦 Tên: ${created_name}"
+            new_backup=$(api_request POST "${PANEL_URL}/api/client/servers/${server_id}/backups" --data "$body") 
+            
+            if [ $? -eq 0 ]; then
+              created_name=$(echo "$new_backup" | jq -r '.attributes.name')
+              SUCCESS_COUNT=$((SUCCESS_COUNT+1))
+              # Gộp log xóa (nếu có) và log tạo thành công
+              MESSAGE_DETAILS="${MESSAGE_DETAILS}✅ <b>${server_name}</b>"$'\n'"${server_log}📦 Tên: ${created_name}"$'\n\n'
+            else
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              MESSAGE_DETAILS="${MESSAGE_DETAILS}❌ <b>${server_name}</b>: Backup thất bại"$'\n\n'
+            fi
           done
+
+          # --- GỬI TIN NHẮN TỔNG HỢP ---
+          # Tạo header thống kê
+          TOTAL_MSG="📊 <b>BÁO CÁO AUTO BACKUP</b>"$'\n'
+          TOTAL_MSG="${TOTAL_MSG}──────────────────"$'\n'
+          TOTAL_MSG="${TOTAL_MSG}✅ Thành công: <b>${SUCCESS_COUNT}</b>"$'\n'
+          TOTAL_MSG="${TOTAL_MSG}❌ Thất bại: <b>${FAIL_COUNT}</b>"$'\n'
+          TOTAL_MSG="${TOTAL_MSG}──────────────────"$'\n\n'
+          
+          # Ghép với nội dung chi tiết
+          FINAL_MSG="${TOTAL_MSG}${MESSAGE_DETAILS}"
+
+          echo "Gửi báo cáo về Telegram..."
+          send_telegram "$FINAL_MSG"
